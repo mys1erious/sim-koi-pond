@@ -1,0 +1,782 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Koi Pond</title>
+<meta name="description" content="A koi pond you can touch: tap to feed the koi, drag to trail your finger. Real-time water simulation, refraction, caustics and floating maple leaves.">
+<style>
+  html, body { margin: 0; height: 100%; background: #0e1a14; overflow: hidden; overscroll-behavior: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: pointer; }
+  .ui { position: fixed; pointer-events: none; color: rgba(244, 240, 228, .9); font: 500 14px/1.35 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        letter-spacing: .02em; text-shadow: 0 1px 3px rgba(0, 0, 0, .75), 0 0 12px rgba(0, 0, 0, .45); }
+  #title { top: max(14px, env(safe-area-inset-top)); left: 16px; font-size: 16px; font-weight: 600; }
+  #hint { bottom: max(18px, env(safe-area-inset-bottom)); left: 16px; right: 16px; text-align: center; }
+  #cur { position: fixed; left: 0; top: 0; width: 46px; height: 46px; margin: -23px 0 0 -23px; border-radius: 50%; pointer-events: none; display: none;
+         background: rgba(255, 255, 255, .28); border: 2px solid rgba(255, 255, 255, .85); box-shadow: 0 2px 10px rgba(0, 0, 0, .35); z-index: 9; }
+  #err { position: fixed; inset: 0; display: none; place-items: center; padding: 16px; text-align: center; color: #eee; font: 15px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="ui" id="title">koi pond</div>
+<div class="ui" id="hint">tap to feed the koi &middot; drag to trail your finger</div>
+<div id="cur"></div>
+<div id="err">This pond needs WebGL2.</div>
+<script>
+'use strict';
+const Q = new URLSearchParams(location.search);
+const CLEAN = Q.has('clean'), PLAY = Q.has('play');
+if (CLEAN) document.querySelectorAll('.ui').forEach((e) => e.remove());
+const cv = document.getElementById('c'), curEl = document.getElementById('cur');
+const gl = cv.getContext('webgl2', { antialias: false, alpha: false, preserveDrawingBuffer: !!window.__recording });
+if (!gl) { document.getElementById('err').style.display = 'grid'; throw new Error('no webgl2'); }
+gl.getExtension('EXT_color_buffer_float'); gl.getExtension('EXT_color_buffer_half_float'); gl.getExtension('OES_texture_float_linear');
+
+// seeded PRNG: the recorder needs a repeatable pond
+function mulberry32(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const rnd = mulberry32(20261027);
+
+// ---------- shaders ----------
+const COMMON = `#version 300 es
+precision highp float;
+uniform vec2 uRes;
+float pondSDF(vec2 p) {
+  vec2 c = uRes * 0.5; float M = min(uRes.x, uRes.y);
+  float m = max(26.0, M * 0.075);
+  vec2 h = c - m; float r = min(h.x, h.y) * 0.55;
+  vec2 q = abs(p - c) - (h - r);
+  float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+  float a = atan(p.y - c.y, p.x - c.x);
+  return d + M * 0.018 * (sin(3.0 * a + 1.3) + 0.7 * sin(5.0 * a + 0.4) + 0.5 * sin(9.0 * a + 2.1));
+}
+float hash1(vec2 p) { return fract(sin(dot(p, vec2(41.3, 289.1))) * 43758.5453); }
+vec2 hash2(vec2 p) { return fract(sin(vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)))) * 43758.5453); }
+float vnoise(vec2 p) { vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash1(i), hash1(i + vec2(1, 0)), f.x), mix(hash1(i + vec2(0, 1)), hash1(i + vec2(1, 1)), f.x), f.y); }
+float fbm(vec2 p) { float s = 0.0, a = 0.5; for (int i = 0; i < 4; i++) { s += a * vnoise(p); p = p * 2.03 + 17.1; a *= 0.5; } return s / 0.9375; }
+// momiji (Japanese maple) leaf in unit space, css y-down, stem toward +y. returns coverage; vein/stem as out params
+float momiji(vec2 l, float aa, out float vein, out float stem) {
+  float r = length(l), la = atan(l.x, -l.y), e = 0.32; vein = 0.0;
+  for (int i = -3; i <= 3; i++) {
+    float ai = float(i) * 0.78, len = i == 0 ? 1.0 : abs(i) == 1 ? 0.93 : abs(i) == 2 ? 0.76 : 0.48, d = abs(la - ai);
+    e = max(e, 0.3 + 0.7 * len * pow(max(0.0, 1.0 - d / 0.5), 1.2));
+    vein = max(vein, (1.0 - smoothstep(0.0, 0.035, d * r)) * (1.0 - smoothstep(len * 0.75, len * 0.9, r)));
+  }
+  e *= 1.0 + 0.04 * sin(la * 46.0) * smoothstep(0.4, 0.8, r); // serrated edge
+  stem = (1.0 - smoothstep(0.024, 0.024 + aa, abs(l.x + 0.05 * l.y * l.y))) * step(0.0, l.y) * (1.0 - smoothstep(0.6, 0.64, l.y));
+  return 1.0 - smoothstep(e - aa, e, r);
+}
+`;
+const VS_FULL = `#version 300 es
+layout(location=0) in vec2 aP; out vec2 vUV;
+void main() { vUV = aP * 0.5 + 0.5; gl_Position = vec4(aP, 0.0, 1.0); }`;
+
+// static floor + rocky rim, rendered once per resize. rgb = color, a = water coverage * (1 - 0.45 * rim shadow)
+const FS_STATIC = COMMON + `
+in vec2 vUV; out vec4 o;
+const vec3 SUN = vec3(-0.43, -0.53, 0.73); // css space (y down), points to the sun
+// voronoi after iq, with a smooth-min border distance so cells come out as rounded stones:
+// x = distance to the (rounded) border, yz = vector to the feature point, w = cell id
+float smin(float a, float b, float k) { float h = max(k - abs(a - b), 0.0) / k; return min(a, b) - h * h * k * 0.25; }
+vec4 voro(vec2 x, float k) {
+  vec2 n = floor(x), f = fract(x), mg, mr; float md = 8.0;
+  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+    vec2 g = vec2(i, j), r = g + 0.15 + 0.7 * hash2(n + g) - f; float d = dot(r, r);
+    if (d < md) { md = d; mr = r; mg = g; } }
+  md = 8.0;
+  for (int j = -2; j <= 2; j++) for (int i = -2; i <= 2; i++) {
+    vec2 g = mg + vec2(i, j), r = g + 0.15 + 0.7 * hash2(n + g) - f;
+    if (dot(mr - r, mr - r) > 1e-5) md = smin(md, dot(0.5 * (mr + r), normalize(r - mr)), k); }
+  return vec4(md, mr, hash1(n + mg));
+}
+vec3 stoneCol(float id) {
+  vec3 c = id < 0.22 ? vec3(0.72, 0.64, 0.52) : id < 0.42 ? vec3(0.52, 0.51, 0.48) : id < 0.58 ? vec3(0.66, 0.46, 0.32)
+         : id < 0.76 ? vec3(0.34, 0.35, 0.36) : id < 0.9 ? vec3(0.82, 0.78, 0.68) : vec3(0.45, 0.36, 0.30);
+  return c * (0.82 + 0.36 * fract(id * 13.7));
+}
+float sR;
+vec4 rockAt(vec2 p, out float id) { // x coverage, y border distance, zw vector to the rock's centre (cell units)
+  vec4 v = voro(p / sR + vec2(3.7, 1.3), 0.35);
+  id = v.w;
+  float ed = v.x + 0.05 * (vnoise(p / sR * 5.0) - 0.5);
+  float isRock = step(-0.06 * sR, pondSDF(p + v.yz * sR));
+  return vec4(isRock * smoothstep(0.035, 0.065, ed), ed, v.yz);
+}
+// rounded stone: a dome over the cell, steeper toward its border
+vec3 domeN(vec2 toCenter, float ed, float slope, vec2 bump) {
+  float k = 1.0 - smoothstep(0.0, slope, ed);
+  return normalize(vec3(-normalize(toCenter + 1e-5) * (0.25 + 1.5 * k * k) + bump, 1.0));
+}
+void main() {
+  vec2 p = vec2(vUV.x, 1.0 - vUV.y) * uRes; float M = min(uRes.x, uRes.y);
+  sR = M / 8.5;
+  float sdf = pondSDF(p);
+  float rid; vec4 rk = rockAt(p, rid);
+  // boulders and the ground between them
+  vec2 bump = vec2(vnoise(p * 0.07), vnoise(p * 0.07 + 7.0)) - 0.5;
+  vec3 rn = domeN(rk.zw, rk.y, 0.42, bump * 0.35);
+  float dif = max(dot(rn, SUN), 0.0);
+  vec3 rc = mix(vec3(0.46, 0.44, 0.40), vec3(0.70, 0.67, 0.60), fract(rid * 7.3)) * (0.88 + 0.24 * fbm(p * 0.12));
+  rc *= mix(vec3(1.06, 1.0, 0.92), vec3(0.92, 0.98, 1.06), fbm(p * 0.035 + rid * 5.0)); // warm/cool mottling
+  rc *= 0.86 + 0.16 * vnoise(p * 0.9) + 0.08 * vnoise(p * 2.3);                         // granite grain
+  rc *= 1.0 - 0.16 * (1.0 - smoothstep(0.0, 0.02, abs(vnoise(p * 0.045 + rid * 9.0) - 0.5))) * smoothstep(0.1, 0.25, rk.y); // hairline cracks
+  float moss = smoothstep(0.5, 0.66, fbm(p / sR * 2.2 + rid * 10.0)) * smoothstep(0.12, 0.3, rk.y);
+  moss *= smoothstep(0.25, 0.55, vnoise(p * 0.3)) * (1.2 - 0.6 * dif);                 // broken up, thicker on the shaded side
+  vec3 mossC = mix(vec3(0.16, 0.27, 0.07), vec3(0.36, 0.44, 0.12), vnoise(p * 0.12)) * (0.7 + 0.6 * vnoise(p * 1.4));
+  rc = mix(rc, mossC, clamp(moss, 0.0, 1.0) * 0.85);
+  rc = mix(rc, vec3(0.74, 0.76, 0.66), smoothstep(0.8, 0.86, vnoise(p * 0.21 + rid * 3.0)) * 0.45); // pale lichen spots
+  float wet = 1.0 - smoothstep(-0.05 * sR, 0.25 * sR, sdf);
+  rc *= mix(1.0, 0.62, wet);
+  rc *= 0.28 + 0.95 * dif;
+  rc += vec3(0.9, 0.92, 0.85) * pow(max(dot(rn, normalize(SUN + vec3(0.0, 0.0, 1.0))), 0.0), 30.0) * (0.06 + 0.3 * wet); // wet sheen at the waterline
+  rc *= 0.75 + 0.25 * smoothstep(0.035, 0.2, rk.y); // contact darkening at the rock's foot
+  vec4 sm = voro(p / (sR * 0.42) + 5.1, 0.25);
+  float smOn = step(-0.02 * sR, pondSDF(p + sm.yz * sR * 0.42)) * smoothstep(0.05, 0.09, sm.x);
+  vec3 smn = domeN(sm.yz, sm.x, 0.4, bump * 0.3);
+  vec3 smc = stoneCol(sm.w) * 0.85 * (0.3 + 0.9 * max(dot(smn, SUN), 0.0)) * mix(1.0, 0.6, wet);
+  vec3 ground = mix(vec3(0.07, 0.08, 0.04), vec3(0.13, 0.19, 0.07), fbm(p * 0.03)) * (0.7 + 0.5 * vnoise(p * 0.4));
+  ground = mix(ground, smc, smOn);
+  ground *= 0.55 + 0.45 * smoothstep(0.0, 0.25, rk.y); // shade under the boulders
+  vec3 rim = mix(ground, rc, rk.x);
+  // a few fallen maple leaves on the stones, dried darker than the floating ones
+  vec2 lc = floor(p / (M * 0.11)), lj = hash2(lc + 4.7);
+  if (hash1(lc + 9.2) > 0.72) {
+    float la = lj.x * 6.283, cs = cos(la), sn = sin(la), ls = M * (0.024 + 0.01 * lj.y);
+    vec2 l = mat2(cs, sn, -sn, cs) * (p - (lc + 0.32 + 0.36 * lj) * M * 0.11) / ls;
+    float lv, lst, lm = momiji(l, 0.08, lv, lst);
+    vec3 lcol = mix(vec3(0.62, 0.12, 0.05), vec3(0.75, 0.38, 0.08), lj.y) * (0.75 + 0.3 * vnoise(l * 6.0)) * (1.0 + 0.2 * lv);
+    rim = mix(rim * (0.65 + 0.35 * smoothstep(0.6, 1.4, length(l - vec2(0.25, 0.3)))), lcol * (0.45 + 0.75 * dif), max(lm, lst));
+  }
+  // pond floor: rounded pebbles on silt, a few bigger stones, algae
+  float s1 = M / 36.0;
+  vec4 v = voro(p / s1, 0.3);
+  float ed = v.x + 0.04 * (vnoise(p / s1 * 3.0) - 0.5);
+  vec3 pn = domeN(v.yz, ed, 0.3, vec2(0.0));
+  vec3 fc = mix(vec3(0.15, 0.13, 0.09) * (0.75 + 0.5 * vnoise(p * 0.15)),
+                stoneCol(v.w) * (0.42 + 0.75 * max(dot(pn, SUN), 0.0)) * (0.9 + 0.2 * vnoise(p * 0.4)),
+                smoothstep(0.05, 0.1, ed));
+  float sand = smoothstep(0.42, 0.58, fbm(p / M * 2.6 + 5.0));
+  vec3 sc = vec3(0.60, 0.53, 0.40) * (0.85 + 0.25 * vnoise(p * 0.08) + 0.1 * vnoise(p * 0.9));
+  fc = mix(fc, sc, sand * (1.0 - smoothstep(0.1, 0.0, ed) * 0.0));
+  float s2 = M / 12.0;
+  vec4 b = voro(p / s2 + 11.3, 0.35);
+  float ba = b.w * 40.0; vec2 bq = mat2(cos(ba), sin(ba), -sin(ba), cos(ba)) * b.yz * vec2(1.0, 1.35); // oval stone around the feature point
+  float bed = 0.28 + 0.1 * fract(b.w * 17.0) - length(bq) + 0.04 * (vnoise(p / s2 * 4.0) - 0.5);
+  float big = step(0.82, b.w);
+  vec3 bn = domeN(b.yz, bed, 0.25, bump * 0.25);
+  fc *= 1.0 - 0.3 * big * smoothstep(-0.1, 0.0, bed); // contact shadow
+  fc = mix(fc, mix(vec3(0.78, 0.72, 0.6), vec3(0.6, 0.5, 0.42), fract(b.w * 31.0)) * (0.5 + 0.7 * max(dot(bn, SUN), 0.0)) * (0.9 + 0.2 * vnoise(p * 0.25)), big * smoothstep(0.0, 0.015, bed));
+  fc *= 0.88 + 0.2 * vnoise(p * 1.1);                                                       // grain on the pebbles
+  fc = mix(fc, vec3(0.30, 0.27, 0.18), smoothstep(0.45, 0.75, fbm(p / M * 7.0 + 9.0)) * 0.35); // a film of silt
+  float al = smoothstep(0.5, 0.78, fbm(p / M * 4.0 + 2.0));
+  fc = mix(fc, fc * vec3(0.5, 0.8, 0.3) + vec3(0.02, 0.05, 0.0), al * 0.75);
+  fc *= mix(0.45, 1.0, smoothstep(0.0, 0.12 * M, -sdf)); // the wall going down
+  // shadow cast by the rim toward the floor
+  vec2 toSun = normalize(SUN.xy);
+  float sh = 0.0;
+  for (int i = 1; i <= 2; i++) {
+    vec2 q = p + toSun * M * 0.035 * float(i); float qid;
+    sh += 0.5 * max(rockAt(q, qid).x, smoothstep(-4.0, 4.0, pondSDF(q)));
+  }
+  float water = (1.0 - rk.x) * (1.0 - smoothstep(-1.5, 1.5, sdf));
+  fc *= 1.0 - 0.4 * sh;
+  o = vec4(mix(rim, fc, water), water * (1.0 - 0.45 * sh));
+}`;
+
+const FS_SIM = `#version 300 es
+precision highp float;
+uniform sampler2D uS, uStatic; uniform vec2 uTx, uSim; uniform vec4 uD[16]; uniform int uN;
+in vec2 vUV; out vec4 o;
+void main() {
+  vec4 s = texture(uS, vUV);
+  float avg = 0.25 * (texture(uS, vUV + vec2(uTx.x, 0.0)).r + texture(uS, vUV - vec2(uTx.x, 0.0)).r
+                    + texture(uS, vUV + vec2(0.0, uTx.y)).r + texture(uS, vUV - vec2(0.0, uTx.y)).r);
+  s.g += (avg - s.r) * 2.0;
+  s.g *= 0.995;
+  s.r += s.g;
+  s.r *= 0.9995;
+  for (int i = 0; i < 16; i++) {
+    if (i >= uN) break;
+    float d = length((vUV - uD[i].xy) * uSim) / uD[i].z;
+    if (d < 1.0) s.r += uD[i].w * (0.5 + 0.5 * cos(3.14159 * d));
+  }
+  if (texture(uStatic, vUV).a < 0.3) s = vec4(0.0); // the stone edge reflects the waves
+  o = s;
+}`;
+
+const FS_COPY = `#version 300 es
+precision highp float;
+uniform sampler2D uStatic; in vec2 vUV; out vec4 o;
+void main() { o = vec4(texture(uStatic, vUV).rgb, 1.0); }`;
+
+const FS_WATER = COMMON + `
+uniform sampler2D uH, uStatic, uScene; uniform vec2 uTx; uniform float uT;
+in vec2 vUV; out vec4 o;
+float caust(vec2 p, float t) { // after Dave_Hoskins / joltz0r "Tileable Water Caustic"
+  p -= 250.0; vec2 i = p; float c = 1.0; const float inten = 0.005;
+  for (int n = 0; n < 4; n++) {
+    float tt = t * (1.0 - (3.5 / float(n + 1)));
+    i = p + vec2(cos(tt - i.x) + sin(tt + i.y), sin(tt - i.y) + cos(tt + i.x));
+    c += 1.0 / length(vec2(p.x / (sin(i.x + tt) / inten), p.y / (cos(i.y + tt) / inten)));
+  }
+  c /= 4.0; c = 1.17 - pow(c, 1.4);
+  return pow(abs(c), 8.0);
+}
+vec3 sky(vec3 R) {
+  vec3 c = mix(vec3(0.70, 0.80, 0.84), vec3(0.32, 0.52, 0.76), clamp(R.z, 0.0, 1.0));
+  vec2 sp = R.xy / max(R.z, 0.2) * 1.6 + vec2(uT * 0.015, 0.0);
+  c = mix(c, vec3(0.94, 0.95, 0.96), smoothstep(0.45, 0.8, vnoise(sp * 1.5) * 0.65 + vnoise(sp * 3.7) * 0.35) * 0.7);
+  float leaf = smoothstep(0.0, 0.06, R.x * 0.8 - R.y * 0.7 - 0.36 + 0.16 * vnoise(R.xy * 14.0) + 0.07 * vnoise(R.xy * 40.0));
+  return mix(c, vec3(0.04, 0.10, 0.05), leaf * 0.9);
+}
+void main() {
+  vec4 st = texture(uStatic, vUV);
+  vec2 p = vec2(vUV.x, 1.0 - vUV.y) * uRes; float M = min(uRes.x, uRes.y);
+  vec2 q = (vUV - 0.5) * uRes / M;
+  float vig = 1.0 - 0.28 * dot(q, q);
+  float wm = smoothstep(0.0, 0.5, st.a);
+  if (wm <= 0.0) { o = vec4(st.rgb * vig, 1.0); return; }
+  float h = texture(uH, vUV).r;
+  float hl = texture(uH, vUV - vec2(uTx.x, 0.0)).r, hr = texture(uH, vUV + vec2(uTx.x, 0.0)).r;
+  float hd = texture(uH, vUV - vec2(0.0, uTx.y)).r, hu = texture(uH, vUV + vec2(0.0, uTx.y)).r;
+  vec2 gs = vec2(hl - hr, hd - hu), g = gs * 3.0;
+  // a breath of wind so a calm pond still shimmers
+  vec2 w1 = p * (12.0 / M) + vec2(uT * 0.25, uT * 0.1), w2 = w1 * 2.7 + vec2(-uT * 0.5, uT * 0.35);
+  float n0 = vnoise(w1) + 0.5 * vnoise(w2);
+  g += 0.25 * vec2(n0 - vnoise(w1 + vec2(0.05, 0.0)) - 0.5 * vnoise(w2 + vec2(0.135, 0.0)),
+                   vnoise(w1 + vec2(0.0, 0.05)) + 0.5 * vnoise(w2 + vec2(0.0, 0.135)) - n0);
+  vec3 n = normalize(vec3(g, 1.0));
+  float lap = hl + hr + hd + hu - 4.0 * h;
+  float sdf = pondSDF(p);
+  float depthF = 0.35 + 0.65 * smoothstep(0.0, 0.3 * M, -sdf);
+  vec4 sc = texture(uScene, vUV + n.xy * 0.05 * M * depthF / uRes);
+  float fl = sc.a; // 1 = floor, 0 = fish
+  float depth = mix(0.16, depthF, fl);
+  float lit = clamp((st.a - 0.55) / 0.45, 0.0, 1.0);
+  float c = caust(p / (0.075 * M) + n.xy * 1.5, uT * 0.5);
+  float focus = clamp(-lap * 9.0, -0.6, 2.0);
+  float cl = (c * 2.0 + focus) * mix(0.3, 1.0, fl) * (0.2 + 0.8 * lit);
+  vec3 col = sc.rgb * (0.62 + cl);
+  vec3 ab = exp(-depth * vec3(1.75, 0.66, 0.74) * 1.25);
+  col = col * ab + vec3(0.02, 0.085, 0.075) * (1.0 - ab.g) + vec3(0.55, 0.85, 0.7) * max(cl, 0.0) * 0.1 * fl;
+  vec3 V = normalize(vec3(-q * 0.55, 1.0));
+  vec3 R = reflect(-V, n);
+  float fres = 0.05 + 0.95 * pow(1.0 - max(dot(n, V), 0.0), 5.0);
+  col = mix(col, sky(R), clamp(fres * 1.5 + 0.02, 0.0, 0.8));
+  // ring faces turned to the sun catch light, the backs go dark: the rings read anywhere on the pond, not just in the glare
+  float slope = dot(gs, vec2(-0.63, 0.78)) * 4.0;
+  col = col * (1.0 + clamp(slope, -0.45, 0.0)) + vec3(0.75, 0.88, 0.85) * clamp(slope, 0.0, 0.6) * 0.55;
+  vec3 L = normalize(vec3(-0.13, 0.17, 1.0));
+  float nh = max(dot(n, normalize(L + V)), 0.0);
+  col += vec3(1.0, 0.96, 0.86) * (pow(nh, 6000.0) * 1.3 + pow(nh, 500.0) * 0.06) * (0.3 + 0.7 * lit);
+  o = vec4(mix(st.rgb, col, wm) * vig, 1.0);
+}`;
+
+const VS_FISH = `#version 300 es
+layout(location=0) in vec2 aP; layout(location=1) in vec2 aU; layout(location=2) in vec3 aK;
+uniform vec2 uRes, uOff; out vec2 vU; out vec3 vK;
+void main() { vU = aU; vK = aK; vec2 p = (aP + uOff) / uRes; gl_Position = vec4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0); }`;
+const FS_FISH = COMMON + `
+uniform float uShadow; in vec2 vU; in vec3 vK; out vec4 o;
+vec3 skin(float u, float v, float type, float seed) {
+  vec3 W = vec3(0.97, 0.95, 0.90), R = vec3(0.98, 0.30, 0.05), B = vec3(0.04, 0.04, 0.05);
+  vec2 pc = vec2(u * 3.4, v * 0.8) + seed * 7.31;
+  float n1 = fbm(pc), n2 = fbm(pc * 2.3 + 5.3);
+  if (type < 0.5) return mix(W, R, smoothstep(0.47, 0.53, n1) * step(0.06, u));                       // kohaku
+  if (type < 1.5) { vec3 c = mix(W, R, smoothstep(0.5, 0.56, n1) * step(0.06, u));                     // sanke
+                    return mix(c, B, smoothstep(0.64, 0.68, n2) * step(0.18, u)); }
+  if (type < 2.5) { vec3 c = mix(B, R, smoothstep(0.46, 0.52, n1));                                     // showa
+                    return mix(c, W, smoothstep(0.54, 0.6, n2)); }
+  if (type < 3.5) return mix(W, R, 1.0 - smoothstep(0.38, 0.46, length(vec2((u - 0.13) * 4.2, v)))); // tancho
+  if (type < 4.5) return mix(vec3(1.0, 0.62, 0.12), vec3(1.0, 0.8, 0.3), n1);                         // ogon
+  return mix(vec3(0.95, 0.28, 0.05), vec3(1.0, 0.42, 0.1), n1);                                       // beni
+}
+void main() {
+  float part = vK.x, u = vU.x, v = vU.y, av = abs(v);
+  float type = floor(vK.y), seed = vK.z;
+  if (part < 0.5) { // body; part carries the gulp (0..0.45) so a feeding koi opens its mouth
+    if (uShadow > 0.5) { o = vec4(0.0, 0.03, 0.02, (1.0 - smoothstep(0.15, 1.0, av)) * 0.72); return; }
+    vec3 c = skin(u, v, type, seed);
+    c = mix(c, vec3(0.08, 0.02, 0.02), (1.0 - smoothstep(0.6, 1.0, length(vec2((u - 0.02) * 26.0, v * 2.0)))) * part / 0.45);
+    c *= 0.5 + 0.5 * sqrt(max(0.0, 1.0 - v * v));
+    float dors = (1.0 - smoothstep(0.0, 0.14, av)) * smoothstep(0.28, 0.34, u) * (1.0 - smoothstep(0.58, 0.68, u));
+    c = mix(c, c * 0.62, dors * 0.7);
+    c *= 0.95 + 0.05 * sin(u * 140.0 + v * 9.0) * sin(u * 140.0 - v * 9.0);
+    c += vec3(0.16) * exp(-v * v * 12.0) * (type > 3.5 && type < 4.5 ? 1.6 : 1.0);
+    float eye = 1.0 - smoothstep(0.55, 1.0, length(vec2((u - 0.075) * 15.0, (av - 0.6) * 3.6)));
+    c = mix(c, vec3(0.02), eye * 0.9);
+    o = vec4(c, 1.0 - smoothstep(0.78, 1.0, av));
+  } else { // 1 tail, 2 fins
+    vec3 base = mix(vec3(0.97, 0.94, 0.9), skin(part < 1.5 ? 1.0 : 0.25, v * 0.3, type, seed), 0.55);
+    if (type > 1.5 && type < 2.5 && part > 1.5) base = mix(vec3(0.03), base, smoothstep(0.1, 0.6, u)); // showa: black fin roots
+    float rays = 0.86 + 0.14 * sin(v * 34.0);
+    float a;
+    if (part < 1.5) { float end = 0.8 + 0.2 * av; a = (1.0 - smoothstep(end - 0.25, end, u)) * (1.0 - smoothstep(0.7, 1.0, av)) * (0.75 - 0.3 * u) * rays; }
+    else a = (1.0 - smoothstep(0.7, 1.0, u + 0.25 * v * v)) * (1.0 - smoothstep(0.7, 1.0, av)) * (0.75 - 0.25 * u) * rays;
+    if (uShadow > 0.5) { o = vec4(0.0, 0.03, 0.02, a * 0.45); return; }
+    o = vec4(base * (0.75 + 0.25 * rays), a);
+  }
+}`;
+
+const VS_PAD = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 aP;
+uniform vec2 uRes, uOff, uTx; uniform vec3 uPad; uniform float uRot, uGrow; uniform sampler2D uH;
+out vec2 vL; out vec3 vN;
+void main() {
+  vec2 cuv = vec2(uPad.x / uRes.x, 1.0 - uPad.y / uRes.y);
+  vec2 e = uTx * 3.0;
+  vec2 g = vec2(texture(uH, cuv - vec2(e.x, 0.0)).r - texture(uH, cuv + vec2(e.x, 0.0)).r,
+                texture(uH, cuv - vec2(0.0, e.y)).r - texture(uH, cuv + vec2(0.0, e.y)).r);
+  float h = texture(uH, cuv).r;
+  vN = normalize(vec3(g * 0.9, 1.0));
+  vL = aP * uGrow;
+  float c = cos(uRot), s = sin(uRot);
+  vec2 pp = uPad.xy + uOff + vec2(g.x, -g.y) * min(uRes.x, uRes.y) * 0.03 + mat2(c, s, -s, c) * vL * uPad.z * (1.0 + 0.06 * h);
+  pp /= uRes;
+  gl_Position = vec4(pp.x * 2.0 - 1.0, 1.0 - pp.y * 2.0, 0.0, 1.0);
+}`;
+const FS_PAD = COMMON + `
+uniform float uKind, uSeed, uPx, uShade; in vec2 vL; in vec3 vN; out vec4 o;
+float petals(float a, float r, float rot, float len) { float k = abs(cos((a + rot) * 4.0)); return 1.0 - smoothstep(len * pow(k, 0.5) - 0.05, len * pow(k, 0.5), r); }
+void main() {
+  float r = length(vL), a = atan(vL.y, vL.x), aa = uShade > 0.5 ? 0.2 : 1.5 / uPx; // shadows get a soft edge
+  vec3 L = normalize(vec3(-0.30, -0.42, 1.0)); // local space is css (y down)
+  vec3 n = normalize(vN * vec3(1.0, -1.0, 1.0) + vec3(vL * 0.18, 0.0));
+  if (uKind > 3.5) { // floating maple leaf
+    float vein, stem, al = momiji(vL, aa, vein, stem); al = max(al, stem);
+    if (uShade > 0.5) { o = vec4(0.0, 0.03, 0.02, al * 0.55); return; }
+    vec3 tip = mix(vec3(0.74, 0.06, 0.04), vec3(0.95, 0.42, 0.05), uSeed * uSeed); // mostly crimson, a few orange
+    vec3 c = mix(vec3(0.97, 0.58, 0.12), tip, 0.35 + 0.65 * smoothstep(0.0, 0.7, r));
+    c = mix(c, c * 1.3 + 0.04, vein * 0.5) * (0.82 + 0.3 * vnoise(vL * 9.0 + uSeed * 20.0));
+    c = mix(c, vec3(0.45, 0.12, 0.05), stem * 0.8);
+    c = c * (0.6 + 0.5 * max(dot(n, L), 0.0)) + vec3(1.0, 0.95, 0.9) * pow(max(dot(n, normalize(L + vec3(0, 0, 1))), 0.0), 40.0) * 0.25;
+    o = vec4(c, al); return;
+  }
+  if (uKind > 2.5) { // koi food pellet, with the meniscus the water pulls up around it
+    float body = 1.0 - smoothstep(1.0 - aa, 1.0, r);
+    if (uShade > 0.5) { o = vec4(0.0, 0.03, 0.02, body * 0.5); return; }
+    vec3 sn = normalize(vec3(vL, sqrt(max(0.0, 1.0 - r * r))));
+    vec3 c = mix(vec3(0.60, 0.38, 0.18), vec3(0.80, 0.56, 0.28), vnoise(vL * 3.0 + uSeed * 30.0)) * (0.35 + 0.8 * max(dot(sn, L), 0.0));
+    c += vec3(1.0, 0.95, 0.85) * pow(max(dot(sn, normalize(L + vec3(0, 0, 1))), 0.0), 30.0) * 0.5;
+    float men = (1.0 - smoothstep(0.0, 0.3, abs(r - 1.18))) * (1.0 - body);
+    o = vec4(mix(vec3(0.85, 0.95, 0.92), c, body), max(body, men * 0.35)); return;
+  }
+  if (uKind > 1.5) { o = vec4(0.0, 0.03, 0.01, (1.0 - smoothstep(0.6, 1.1, r)) * 0.62); return; }
+  if (uKind > 0.5) { // water lily flower, top-down
+    float l1 = petals(a, r, 0.0, 1.0), l2 = petals(a, r, 0.39, 0.8), l3 = petals(a, r, 0.2, 0.56);
+    vec3 pink = vec3(0.97, 0.50, 0.68), pale = vec3(1.0, 0.86, 0.91);
+    vec3 c = pink * (0.62 + 0.38 * r);
+    c = mix(c * 0.8, mix(pink, pale, 0.45) * (0.7 + 0.4 * r), l2);
+    c = mix(c * 0.85, pale * (0.8 + 0.3 * r), l3);
+    float ctr = 1.0 - smoothstep(0.17, 0.2, r);
+    c = mix(c, vec3(1.0, 0.78, 0.18) * (0.85 + 0.3 * vnoise(vL * 40.0)), ctr);
+    float shadow = (1.0 - smoothstep(0.7, 1.2, r)) * 0.35;
+    float al = max(l1, ctr);
+    c *= 0.8 + 0.3 * max(dot(n, L), 0.0);
+    o = vec4(mix(vec3(0.0, 0.03, 0.02), c, al), max(al, shadow * (1.0 - al)));
+    return;
+  }
+  float edge = 1.0 + 0.025 * sin(a * 5.0 + uSeed * 3.0) + 0.015 * sin(a * 11.0 + uSeed);
+  float da = abs(mod(a - uSeed * 6.283 + 3.14159, 6.28318) - 3.14159);
+  float inside = (1.0 - smoothstep(edge - aa, edge, r)) * smoothstep(0.0, aa, (da - 0.14) * r);
+  vec3 base = mix(vec3(0.07, 0.20, 0.06), vec3(0.17, 0.34, 0.09), smoothstep(0.15, 1.0, r));
+  float vein = smoothstep(0.96, 1.0, abs(cos(a * 9.0 + uSeed))) * smoothstep(0.1, 0.3, r) * (1.0 - smoothstep(0.85, 1.0, r));
+  base = mix(base, vec3(0.30, 0.46, 0.16), vein * 0.3);
+  base = mix(base, vec3(0.5, 0.22, 0.12), smoothstep(0.86, 1.0, r / edge) * 0.65);
+  base *= 0.82 + 0.3 * vnoise(vL * 5.0 + uSeed * 9.0);
+  vec3 c = base * (0.55 + 0.6 * max(dot(n, L), 0.0)) + vec3(0.9, 0.95, 0.8) * pow(max(dot(n, normalize(L + vec3(0, 0, 1))), 0.0), 60.0) * 0.35;
+  c *= 0.9 + 0.1 * smoothstep(0.0, 0.08, r); // stem dimple
+  float halo = (1.0 - smoothstep(edge, edge + 0.22, r)) * 0.3;
+  o = vec4(mix(vec3(0.0, 0.03, 0.02), c, inside), max(inside, halo * (1.0 - inside)));
+}`;
+
+function compile(vs, fs) {
+  const p = gl.createProgram();
+  for (const [t, s] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+    const sh = gl.createShader(t); gl.shaderSource(sh, s); gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+    gl.attachShader(p, sh);
+  }
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const cache = {};
+  return { p, u: (n) => (n in cache ? cache[n] : (cache[n] = gl.getUniformLocation(p, n))) };
+}
+const P = {
+  stat: compile(VS_FULL, FS_STATIC), sim: compile(VS_FULL, FS_SIM), copy: compile(VS_FULL, FS_COPY),
+  water: compile(VS_FULL, FS_WATER), fish: compile(VS_FISH, FS_FISH), pad: compile(VS_PAD, FS_PAD),
+};
+
+// geometry: one big triangle, a unit quad, a dynamic fish buffer
+function vao(data, layout, usage = gl.STATIC_DRAW) {
+  const a = gl.createVertexArray(), b = gl.createBuffer(); gl.bindVertexArray(a); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, data, usage);
+  const stride = layout.reduce((s, n) => s + n, 0) * 4; let off = 0;
+  layout.forEach((n, i) => { gl.enableVertexAttribArray(i); gl.vertexAttribPointer(i, n, gl.FLOAT, false, stride, off); off += n * 4; });
+  return { a, b };
+}
+const TRI = vao(new Float32Array([-1, -1, 3, -1, -1, 3]), [2]);
+const QUAD = vao(new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), [2]);
+const FISH_BUF = new Float32Array(7 * 8 * 260);
+const FISHV = vao(FISH_BUF, [2, 2, 3], gl.DYNAMIC_DRAW);
+
+function target(w, h, half) {
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  const f = gl.createFramebuffer();
+  const fmts = half ? [[gl.RGBA16F, gl.HALF_FLOAT], [gl.RGBA32F, gl.FLOAT]] : [[gl.RGBA8, gl.UNSIGNED_BYTE]];
+  for (const [ifmt, type] of fmts) {
+    gl.texImage2D(gl.TEXTURE_2D, 0, ifmt, w, h, 0, gl.RGBA, type, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE) break;
+  }
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  return { t, f, w, h };
+}
+function bindTex(unit, t) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t); }
+
+// ---------- sizes ----------
+let W = 0, H = 0, M = 1, BW = 0, BH = 0, SW = 0, SH = 0, stat, scene, hA, hB;
+function pondSDF(x, y) { // same as the GLSL one, in css px
+  const cx = W / 2, cy = H / 2, m = Math.max(26, M * 0.075), hx = cx - m, hy = cy - m, r = Math.min(hx, hy) * 0.55;
+  const qx = Math.abs(x - cx) - (hx - r), qy = Math.abs(y - cy) - (hy - r);
+  const d = Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - r, a = Math.atan2(y - cy, x - cx);
+  return d + M * 0.018 * (Math.sin(3 * a + 1.3) + 0.7 * Math.sin(5 * a + 0.4) + 0.5 * Math.sin(9 * a + 2.1));
+}
+function resize() {
+  const w = innerWidth, h = innerHeight; if (w === W && h === H) return;
+  const k = W ? Math.min(w, h) / M : 1;
+  for (const f of fish) { f.x *= w / W; f.y *= h / H; f.L *= k; f.W *= k; f.pts.forEach((p) => { p[0] *= w / W; p[1] *= h / H; }); }
+  for (const o of [...leaves, ...food]) { o.x *= w / W; o.y *= h / H; }
+  W = w; H = h; M = Math.min(W, H);
+  let dpr = Math.min(devicePixelRatio || 1, 2);
+  if (W * H * dpr * dpr > 2.6e6) dpr = Math.sqrt(2.6e6 / (W * H)); // keep 60 fps on big screens
+  BW = Math.round(W * dpr); BH = Math.round(H * dpr); cv.width = BW; cv.height = BH;
+  const cell = M / 300; SW = Math.round(W / cell); SH = Math.round(H / cell);
+  for (const t of [stat, scene, hA, hB]) if (t) { gl.deleteTexture(t.t); gl.deleteFramebuffer(t.f); }
+  stat = target(BW, BH, false); scene = target(BW, BH, false); hA = target(SW, SH, true); hB = target(SW, SH, true);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, stat.f); gl.viewport(0, 0, BW, BH);
+  gl.useProgram(P.stat.p); gl.uniform2f(P.stat.u('uRes'), W, H);
+  gl.bindVertexArray(TRI.a); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  pads.forEach((p) => { p.x = p.fx * W; p.y = p.fy * H; p.r = p.fr * M; });
+}
+
+// ---------- water sim ----------
+const pending = [];
+function disturb(x, y, radiusCells, strength) {
+  pending.push([x / W, 1 - y / H, radiusCells, strength]);
+  if (pending.length > 96) pending.splice(0, pending.length - 96);
+}
+const DROPS = new Float32Array(64);
+function simStep() {
+  const n = Math.min(16, pending.length);
+  pending.splice(0, n).forEach((d, i) => DROPS.set(d, i * 4));
+  gl.bindFramebuffer(gl.FRAMEBUFFER, hB.f); gl.viewport(0, 0, SW, SH);
+  gl.useProgram(P.sim.p);
+  bindTex(0, hA.t); bindTex(1, stat.t);
+  gl.uniform1i(P.sim.u('uS'), 0); gl.uniform1i(P.sim.u('uStatic'), 1);
+  gl.uniform2f(P.sim.u('uTx'), 1 / SW, 1 / SH); gl.uniform2f(P.sim.u('uSim'), SW, SH);
+  gl.uniform4fv(P.sim.u('uD'), DROPS); gl.uniform1i(P.sim.u('uN'), n);
+  gl.bindVertexArray(TRI.a); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  [hA, hB] = [hB, hA];
+}
+
+// ---------- koi ----------
+const NB = 20, NT = 6, NP = NB + 1 + NT;
+const TYPES = [0, 4, 2, 3, 1, 5, 0]; // kohaku, ogon, showa, tancho, sanke, chagoi, kohaku
+const fish = [];
+const events = []; // recent splashes the koi flee from
+const ptr = { down: false, x: 0, y: 0, seen: -99, lastEv: -99, carry: 0 };
+let T = 0, lastScare = -99;
+const angDiff = (a, b) => Math.atan2(Math.sin(a - b), Math.cos(a - b));
+function segLen(f, j) { return j <= NB ? f.L / NB : (f.L * 0.42) / NT; }
+function bodyW(s) { return s < 0.28 ? Math.sqrt(Math.max(0, 1 - ((0.28 - s) / 0.28) ** 2)) : 1 - 0.82 * ((s - 0.28) / 0.72) ** 1.25; }
+function spawnFish() {
+  for (let i = 0; i < TYPES.length; i++) {
+    const L = M * 0.21 * (0.82 + 0.3 * rnd());
+    let x, y; do { x = W * (0.15 + 0.7 * rnd()); y = H * (0.15 + 0.7 * rnd()); } while (pondSDF(x, y) > -L * 0.6);
+    const f = { L, W: L * 0.115, type: TYPES[i], seed: rnd() * 10, x, y, a: rnd() * 6.283, v: L * 0.3, phase: rnd() * 6, scare: 0, flee: 0, kiss: 2 + rnd() * 8, hungry: 0, gulp: 0, pts: [] };
+    let d = 0; for (let j = 0; j < NP; j++) { f.pts.push([x - Math.cos(f.a) * d, y - Math.sin(f.a) * d]); d += segLen(f, j + 1); }
+    fish.push(f);
+  }
+}
+function updateFish(dt) {
+  for (const f of fish) {
+    let turn = 0.55 * Math.sin(T * 0.37 + f.seed * 3) + 0.4 * Math.sin(T * 0.93 + f.seed * 7);
+    const cdx = W / 2 - f.x, cdy = H / 2 - f.y;
+    if (Math.hypot(cdx, cdy) > M * 0.22) turn += angDiff(Math.atan2(cdy, cdx), f.a) * 0.35; // drift back to open water
+    // curious koi come to a hovering hand (they expect food); a splash cancels that for a moment
+    if (!ptr.down && T - ptr.seen < 4 && T - lastScare > 1.5 && f.scare < 0.1) {
+      const dx = ptr.x - f.x, dy = ptr.y - f.y, dd = Math.hypot(dx, dy);
+      if (dd < M * 0.7 && dd > f.L * 0.3) turn += angDiff(Math.atan2(dy, dx), f.a) * 1.1;
+    }
+    for (const e of events) {
+      if (T - e.t > 0.35) continue;
+      const dx = f.x - e.x, dy = f.y - e.y, dd = Math.hypot(dx, dy);
+      if (dd < e.r) { const k = 0.55 + 0.45 * (1 - dd / e.r); if (k >= f.scare * 0.8) f.flee = Math.atan2(dy, dx); f.scare = Math.max(f.scare, k); }
+    }
+    // food: the nearest floating pellet wins over everything but a scare
+    let tgt = null, td = M * 1.6;
+    for (const p of food) if (p.landed) { const d = Math.hypot(p.x - f.x, p.y - f.y); if (d < td) { td = d; tgt = p; } }
+    f.hungry += ((tgt ? 1 : 0) - f.hungry) * Math.min(1, dt * 3);
+    if (tgt) turn = angDiff(Math.atan2(tgt.y - f.y, tgt.x - f.x), f.a) * 3.5 + turn * 0.2;
+    if (f.scare > 0.05) turn = angDiff(f.flee, f.a) * 9 * f.scare + turn * (1 - f.scare);
+    const la = f.L * 0.8 + f.v * 0.5, hx = f.x + Math.cos(f.a) * la, hy = f.y + Math.sin(f.a) * la;
+    const d = pondSDF(hx, hy), margin = f.L * 0.7;
+    if (d > -margin) {
+      const gx = pondSDF(hx + 1, hy) - pondSDF(hx - 1, hy), gy = pondSDF(hx, hy + 1) - pondSDF(hx, hy - 1);
+      turn += angDiff(Math.atan2(-gy, -gx), f.a) * 4 * Math.min(1, (d + margin) / margin);
+    }
+    for (const g of fish) if (g !== f) {
+      const dx = f.x - g.x, dy = f.y - g.y, dd = Math.hypot(dx, dy);
+      if (dd < f.L * 0.8) turn += angDiff(Math.atan2(dy, dx), f.a) * 0.8 * (1 - dd / (f.L * 0.8));
+    }
+    const maxT = 1.8 + 9 * f.scare + 2.5 * f.hungry; turn = Math.max(-maxT, Math.min(maxT, turn));
+    f.a += turn * dt;
+    const rush = f.hungry * (tgt ? Math.max(0.45, Math.min(1, td / f.L)) : 1); // race in, ease off for the bite
+    f.v += (f.L * (0.3 + 2.0 * f.scare + 1.0 * rush) - f.v) * Math.min(1, dt * 7);
+    if (tgt && f.scare < 0.2 && Math.hypot(tgt.x - f.x, tgt.y - f.y) < f.L * 0.15) {
+      food.splice(food.indexOf(tgt), 1); f.gulp = 0.35;
+      wave(f.x + Math.cos(f.a) * f.L * 0.03, f.y + Math.sin(f.a) * f.L * 0.03, 3.5, 0.5);
+    }
+    f.gulp = Math.max(0, f.gulp - dt);
+    f.x += Math.cos(f.a) * f.v * dt; f.y += Math.sin(f.a) * f.v * dt;
+    const sd = pondSDF(f.x, f.y);
+    const keep = M * 0.06; // boulders overhang the edge, keep koi out from under them
+    if (sd > -keep) { const gx = pondSDF(f.x + 1, f.y) - pondSDF(f.x - 1, f.y), gy = pondSDF(f.x, f.y + 1) - pondSDF(f.x, f.y - 1), gl2 = Math.hypot(gx, gy) || 1, push = sd + keep; f.x -= gx / gl2 * push; f.y -= gy / gl2 * push; }
+    f.scare *= Math.exp(-dt * 1.8);
+    f.phase += dt * (4 + 9 * f.v / f.L);
+    f.pts[0][0] = f.x; f.pts[0][1] = f.y;
+    for (let j = 1; j < NP; j++) {
+      const a = f.pts[j - 1], b = f.pts[j], dx = b[0] - a[0], dy = b[1] - a[1], dd = Math.hypot(dx, dy) || 1, s = segLen(f, j);
+      b[0] = a[0] + dx / dd * s; b[1] = a[1] + dy / dd * s;
+    }
+    if (f.v > f.L * 1.1) disturb(f.x, f.y, 3, 0.012 * f.v / f.L); // darting koi leave a wake
+    if ((f.kiss -= dt) < 0) { f.kiss = 5 + rnd() * 9; if (f.scare < 0.1) wave(f.x + Math.cos(f.a) * f.L * 0.05, f.y + Math.sin(f.a) * f.L * 0.05, 3, 0.35); }
+  }
+  while (events.length && T - events[0].t > 1) events.shift();
+}
+let nv = 0;
+function vtx(x, y, u, v, part, f) { FISH_BUF.set([x, y, u, v, part, f.type, f.seed], nv * 7); nv++; }
+function quad(a, b, c, d, part, f) { for (const q of [a, b, c, a, c, d]) vtx(q[0], q[1], q[2], q[3], part, f); }
+function buildFish() {
+  nv = 0;
+  for (const f of fish) {
+    const amp = f.W * (1 + 0.6 * Math.min(1, f.scare)), pts = [], tan = [];
+    for (let j = 0; j < NP; j++) {
+      const a = f.pts[Math.max(0, j - 1)], b = f.pts[Math.min(NP - 1, j + 1)];
+      let tx = a[0] - b[0], ty = a[1] - b[1]; const tl = Math.hypot(tx, ty) || 1; tx /= tl; ty /= tl;
+      const s = j <= NB ? j / NB : 1 + (j - NB) / NT * 0.42, lat = amp * (0.12 + 1.0 * s * s) * Math.sin(f.phase - 5 * s);
+      pts.push([f.pts[j][0] - ty * lat, f.pts[j][1] + tx * lat]); tan.push([tx, ty]);
+    }
+    // tail fin
+    for (let j = NB; j < NP - 1; j++) {
+      const w0 = f.W * (0.18 + 1.25 * ((j - NB) / (NT - 1)) ** 0.9), w1 = f.W * (0.18 + 1.25 * ((j + 1 - NB) / (NT - 1)) ** 0.9);
+      const [p0, p1, t0, t1] = [pts[j], pts[j + 1], tan[j], tan[j + 1]], u0 = (j - NB) / (NT - 1), u1 = (j + 1 - NB) / (NT - 1);
+      quad([p0[0] - t0[1] * w0, p0[1] + t0[0] * w0, u0, 1], [p1[0] - t1[1] * w1, p1[1] + t1[0] * w1, u1, 1],
+           [p1[0] + t1[1] * w1, p1[1] - t1[0] * w1, u1, -1], [p0[0] + t0[1] * w0, p0[1] - t0[0] * w0, u0, -1], 1, f);
+    }
+    // pelvic and pectoral fins
+    for (const [jf, len, ang, wid] of [[11, 0.11, 0.75, 0.04], [4, 0.21, 0.95, 0.065]]) {
+      const [px, py] = pts[jf], [tx, ty] = tan[jf], w = f.W * bodyW(jf / NB) * 0.8;
+      for (const side of [1, -1]) {
+        const an = side * (ang + 0.25 * Math.sin(f.phase * 0.5 + side) - 0.55 * Math.min(1, f.scare));
+        const nx = -ty * side, ny = tx * side; // outward normal
+        const rx = px + nx * w, ry = py + ny * w;
+        const dx = -tx * Math.cos(Math.abs(an)) + nx * Math.sin(Math.abs(an)), dy = -ty * Math.cos(Math.abs(an)) + ny * Math.sin(Math.abs(an));
+        const L = f.L * len, tw = f.L * wid, rw = f.L * 0.025;
+        quad([rx + tx * rw, ry + ty * rw, 0, -1], [rx + dx * L - dy * tw, ry + dy * L + dx * tw, 1, -1],
+             [rx + dx * L + dy * tw, ry + dy * L - dx * tw, 1, 1], [rx - tx * rw, ry - ty * rw, 0, 1], 2, f);
+      }
+    }
+    // body
+    for (let j = 0; j < NB; j++) {
+      const s0 = j / NB, s1 = (j + 1) / NB, w0 = f.W * bodyW(s0), w1 = f.W * bodyW(s1), [p0, p1, t0, t1] = [pts[j], pts[j + 1], tan[j], tan[j + 1]];
+      quad([p0[0] - t0[1] * w0, p0[1] + t0[0] * w0, s0, 1], [p1[0] - t1[1] * w1, p1[1] + t1[0] * w1, s1, 1],
+           [p1[0] + t1[1] * w1, p1[1] - t1[0] * w1, s1, -1], [p0[0] + t0[1] * w0, p0[1] - t0[0] * w0, s0, -1], 0.45 * Math.min(1, f.gulp * 5), f);
+    }
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, FISHV.b); gl.bufferSubData(gl.ARRAY_BUFFER, 0, FISH_BUF, 0, nv * 7);
+}
+function drawFish(shadow) {
+  gl.useProgram(P.fish.p); gl.uniform2f(P.fish.u('uRes'), W, H);
+  gl.uniform2f(P.fish.u('uOff'), shadow ? M * 0.045 : 0, shadow ? M * 0.06 : 0); gl.uniform1f(P.fish.u('uShadow'), shadow ? 1 : 0);
+  gl.bindVertexArray(FISHV.a); gl.drawArrays(gl.TRIANGLES, 0, nv);
+}
+
+// ---------- lily pads ----------
+const pads = [[0.80, 0.16, 0.10, 0], [0.67, 0.10, 0.055, 0], [0.19, 0.80, 0.095, 1], [0.32, 0.89, 0.06, 0], [0.88, 0.62, 0.065, 0]]
+  .map(([fx, fy, fr, flower], i) => ({ fx, fy, fr, flower, seed: rnd(), rot: rnd() * 6.283, x: 0, y: 0, r: 0 }));
+function padSetup() {
+  gl.useProgram(P.pad.p); bindTex(0, hA.t);
+  gl.uniform1i(P.pad.u('uH'), 0); gl.uniform2f(P.pad.u('uRes'), W, H); gl.uniform2f(P.pad.u('uTx'), 1 / SW, 1 / SH);
+  gl.bindVertexArray(QUAD.a);
+}
+function padDraw(x, y, r, rot, kind, seed, grow, off, shade) {
+  gl.uniform3f(P.pad.u('uPad'), x, y, r); gl.uniform1f(P.pad.u('uRot'), rot); gl.uniform1f(P.pad.u('uGrow'), grow);
+  gl.uniform1f(P.pad.u('uKind'), kind); gl.uniform1f(P.pad.u('uSeed'), seed); gl.uniform1f(P.pad.u('uPx'), r * BW / W);
+  gl.uniform1f(P.pad.u('uShade'), shade); gl.uniform2f(P.pad.u('uOff'), off[0], off[1]); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+function drawPads(kind, off) {
+  padSetup();
+  for (const p of pads) {
+    const rot = p.rot + 0.15 * Math.sin(T * 0.11 + p.seed * 9);
+    padDraw(p.x, p.y, p.r, rot, kind, p.seed, 1.25, off, 0);
+    if (p.flower && kind === 0) padDraw(p.x + p.r * 0.12, p.y - p.r * 0.08, p.r * 0.5, rot, 1, p.seed, 1.25, off, 0);
+  }
+}
+
+// ---------- things floating on the surface: maple leaves and koi food ----------
+const leaves = [], food = [], rings = [];
+function wave(x, y, radiusCells, strength) { disturb(x, y, radiusCells, strength); rings.push({ x, y, t: T, s: strength }); }
+function spawnLeaves() {
+  for (let i = 0; i < 6; i++) {
+    let x, y; do { x = W * (0.12 + 0.76 * rnd()); y = H * (0.12 + 0.76 * rnd()); } while (pondSDF(x, y) > -M * 0.12);
+    leaves.push({ x, y, fr: 0.04 + 0.016 * rnd(), rot: rnd() * 6.283, spin: (rnd() - 0.5) * 0.12, seed: rnd(), vx: 0, vy: 0 });
+  }
+}
+function feed(x, y) { // a handful of pellets, landing a few hundredths of a second apart
+  for (let i = 0; i < 7; i++) {
+    const a = rnd() * 6.283, r = M * 0.045 * Math.sqrt(rnd());
+    food.push({ x: x + Math.cos(a) * r, y: y + Math.sin(a) * r, vx: 0, vy: 0, at: T + 0.05 * i, landed: false, seed: rnd() });
+  }
+}
+function updateFloaters(dt) {
+  const c = M * 0.28; // ring speed in css px/s (sim: ~0.7 cell per 1/120 s step, cell = M/300)
+  const wa = 0.6 + 2.5 * Math.sin(T * 0.013), wx = Math.cos(wa) * M * 0.003, wy = Math.sin(wa) * M * 0.003; // a slow breeze
+  for (const o of [...leaves, ...food]) {
+    if (o.at !== undefined && !o.landed) { if (T < o.at) continue; o.landed = true; wave(o.x, o.y, 3, 0.5); }
+    for (const g of rings) { // a passing ring pushes the floater outward
+      const age = T - g.t, dx = o.x - g.x, dy = o.y - g.y, d = Math.hypot(dx, dy) || 1;
+      if (age < 2 && Math.abs(d - c * age) < M * 0.025) { const k = g.s * M * (o.fr ? 0.9 : 0.12) * (1 - age / 2) / (1 + d / (M * 0.15)); o.vx += dx / d * k * dt; o.vy += dy / d * k * dt; }
+    }
+    o.vx += (wx - o.vx) * Math.min(1, dt * 1.2); o.vy += (wy - o.vy) * Math.min(1, dt * 1.2);
+    o.x += o.vx * dt; o.y += o.vy * dt;
+    if (o.fr) o.rot += (o.spin + o.vx / M * 0.8) * dt;
+    const keep = M * (o.fr ? 0.06 + o.fr : 0.13), sd = pondSDF(o.x, o.y); // clear of the boulders; food stays where koi can reach it
+    if (sd > -keep) {
+      const gx = pondSDF(o.x + 1, o.y) - pondSDF(o.x - 1, o.y), gy = pondSDF(o.x, o.y + 1) - pondSDF(o.x, o.y - 1), gl2 = Math.hypot(gx, gy) || 1;
+      const nx = gx / gl2, ny = gy / gl2, vn = o.vx * nx + o.vy * ny;
+      o.x -= nx * (sd + keep); o.y -= ny * (sd + keep); if (vn > 0) { o.vx -= 1.5 * vn * nx; o.vy -= 1.5 * vn * ny; }
+    }
+  }
+  for (const a of leaves) for (const b of leaves) if (a !== b) { // leaves bump instead of stacking
+    const dx = a.x - b.x, dy = a.y - b.y, d = Math.hypot(dx, dy) || 1, r = (a.fr + b.fr) * M * 0.9;
+    if (d < r) { a.vx += dx / d * (r - d) * 2 * dt * 60; a.vy += dy / d * (r - d) * 2 * dt * 60; }
+  }
+  while (rings.length && T - rings[0].t > 2) rings.shift();
+}
+function drawFloaters(shade, off) {
+  padSetup();
+  for (const l of leaves) padDraw(l.x, l.y, l.fr * M, l.rot, 4, l.seed, 1.15, off, shade);
+  for (const p of food) if (p.landed) padDraw(p.x, p.y, M * 0.0075, 0, 3, p.seed, 1.6, off, shade);
+}
+
+// ---------- input ----------
+function trail(x0, y0, x1, y1) {
+  const cell = M / 300, step = cell * 2.5, len = Math.hypot(x1 - x0, y1 - y0);
+  let s = step - ptr.carry;
+  for (; s <= len; s += step) disturb(x0 + (x1 - x0) * s / len, y0 + (y1 - y0) * s / len, 4.5, 0.11);
+  ptr.carry = len - (s - step);
+  if (T - ptr.lastEv > 0.05) { events.push({ x: x1, y: y1, t: T, r: M * 0.22 }); ptr.lastEv = T; lastScare = T; }
+  for (const o of [...leaves, ...food]) { // the finger drags floaters along
+    const d = Math.hypot(o.x - x1, o.y - y1), R = M * 0.07;
+    if (d < R) { o.vx += (x1 - x0) * 1.5 * (1 - d / R); o.vy += (y1 - y0) * 1.5 * (1 - d / R); }
+  }
+}
+// a tap feeds the koi, a drag is a finger in the water (they scatter)
+function pDown(x, y) { ptr.down = true; ptr.x = ptr.sx = x; ptr.y = ptr.sy = y; ptr.carry = 0; ptr.drag = false; const h = document.getElementById('hint'); if (h) h.remove(); }
+function pMove(x, y) {
+  if (ptr.down && !ptr.drag && Math.hypot(x - ptr.sx, y - ptr.sy) > M * 0.02) { ptr.drag = true; ptr.x = ptr.sx; ptr.y = ptr.sy; }
+  if (ptr.drag) trail(ptr.x, ptr.y, x, y);
+  ptr.x = x; ptr.y = y; ptr.seen = T;
+}
+function pUp() { if (ptr.down && !ptr.drag) feed(ptr.sx, ptr.sy); ptr.down = false; ptr.drag = false; }
+cv.addEventListener('pointerdown', (e) => { cv.setPointerCapture(e.pointerId); pDown(e.clientX, e.clientY); });
+cv.addEventListener('pointermove', (e) => pMove(e.clientX, e.clientY));
+addEventListener('pointerup', pUp); addEventListener('pointercancel', pUp);
+
+// ?play: replays video/keys.json (recorder format, authored for 1080x1350) with its own touch cursor
+let KEYS = null;
+if (PLAY) fetch('video/keys.json').then((r) => r.json()).then((k) => { KEYS = k; }).catch(() => {});
+const cr = (p0, p1, p2, p3, t) => 0.5 * (2 * p1 + (p2 - p0) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (3 * p1 - p0 - 3 * p2 + p3) * t * t * t);
+function keyAt(t) {
+  const K = KEYS; if (!K || t < K[0].t) return null;
+  for (let i = 0; i < K.length - 1; i++) {
+    const a = K[i], b = K[i + 1]; if (t > b.t) continue;
+    const k = Math.min(1, (t - a.t) / (b.t - a.t || 1));
+    if (a.down && b.down) { // smooth drag through the neighbouring keys
+      const p0 = K[i - 1] && K[i - 1].down ? K[i - 1] : a, p3 = K[i + 2] && K[i + 2].down ? K[i + 2] : b;
+      return { x: cr(p0.x, a.x, b.x, p3.x, k), y: cr(p0.y, a.y, b.y, p3.y, k), down: true, hide: !!a.hide };
+    }
+    const e = k * k * (3 - 2 * k);
+    return { x: a.x + (b.x - a.x) * e, y: a.y + (b.y - a.y) * e, down: !!a.down, hide: !!a.hide };
+  }
+  const z = K[K.length - 1]; return { x: z.x, y: z.y, down: !!z.down, hide: !!z.hide };
+}
+function playUpdate() {
+  if (!KEYS) return;
+  const span = KEYS[KEYS.length - 1].t + 2, p = keyAt(T % span);
+  if (!p || p.hide) { curEl.style.display = 'none'; if (ptr.down) pUp(); return; }
+  const x = p.x * W / 1080, y = p.y * H / 1350;
+  if (p.down && !ptr.down) pDown(x, y); else if (!p.down && ptr.down) pUp();
+  pMove(x, y);
+  curEl.style.display = 'block';
+  curEl.style.transform = `translate(${x}px, ${y}px) scale(${p.down ? 0.8 : 1})`;
+  curEl.style.background = p.down ? 'rgba(255,255,255,.5)' : 'rgba(255,255,255,.28)';
+}
+
+// ---------- frame ----------
+function render() {
+  buildFish();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, scene.f); gl.viewport(0, 0, BW, BH);
+  gl.disable(gl.BLEND);
+  gl.useProgram(P.copy.p); bindTex(1, stat.t); gl.uniform1i(P.copy.u('uStatic'), 1);
+  gl.bindVertexArray(TRI.a); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.enable(gl.BLEND);
+  gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ZERO, gl.ONE); // shadows keep the floor mask
+  drawPads(2, [M * 0.05, M * 0.065]);
+  drawFloaters(1, [M * 0.05, M * 0.065]);
+  drawFish(true);
+  gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ZERO, gl.ONE_MINUS_SRC_ALPHA); // alpha -> 0 where a koi is
+  drawFish(false);
+  gl.disable(gl.BLEND);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, BW, BH);
+  const w = P.water; gl.useProgram(w.p);
+  bindTex(0, hA.t); bindTex(1, stat.t); bindTex(2, scene.t);
+  gl.uniform1i(w.u('uH'), 0); gl.uniform1i(w.u('uStatic'), 1); gl.uniform1i(w.u('uScene'), 2);
+  gl.uniform2f(w.u('uRes'), W, H); gl.uniform2f(w.u('uTx'), 1 / SW, 1 / SH); gl.uniform1f(w.u('uT'), T);
+  gl.bindVertexArray(TRI.a); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  drawPads(0, [0, 0]);
+  drawFloaters(0, [0, 0]);
+  gl.disable(gl.BLEND);
+}
+const STEP = 1 / 120;
+let last = null, acc = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  resize();
+  const t = now / 1000, dt = last === null ? 1 / 60 : Math.min(0.05, Math.max(0, t - last)); last = t;
+  T += dt;
+  if (PLAY) playUpdate();
+  updateFish(dt);
+  updateFloaters(dt);
+  acc += dt; let n = 0;
+  while (acc >= STEP && n < 8) { simStep(); acc -= STEP; n++; }
+  if (n === 8) acc = 0;
+  render();
+}
+resize();
+spawnFish();
+spawnLeaves();
+// warm up so the very first frame is already alive: koi spread out, a couple of rings on the water
+for (let i = 0; i < 180; i++) { T += 1 / 60; updateFish(1 / 60); updateFloaters(1 / 60); if (i > 60) { simStep(); simStep(); } }
+T = 0; events.length = 0; rings.length = 0;
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
